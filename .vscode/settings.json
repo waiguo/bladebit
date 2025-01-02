@@ -4,15 +4,16 @@
         "nominmax"
     ],
     "files.associations": {
+        "*.sd": "yaml",
+        "*.userprefs": "xml",
+        "*.make": "makefile",
         "Fastfile": "ruby",
         "*.plist": "xml",
-        "*.sd": "yaml",
         "*.json": "jsonc",
         "*.ir": "llvm",
         "*.qs": "javascript",
         "*.ac": "shellscript",
         "player": "json",
-        "*.userprefs": "xml",
         "memory": "cpp",
         "cstddef": "cpp",
         "string": "cpp",
@@ -99,14 +100,49 @@
         "__tuple": "cpp",
         "ios": "cpp",
         "locale": "cpp",
-        "stack": "cpp"
+        "stack": "cpp",
+        "*.include": "cpp",
+        "relic_core.h": "c",
+        "compare": "cpp",
+        "concepts": "cpp",
+        "numbers": "cpp",
+        "semaphore": "cpp",
+        "stop_token": "cpp",
+        "queue": "cpp",
+        "__memory": "cpp",
+        "filesystem": "cpp",
+        "__bits": "cpp",
+        "csignal": "cpp",
+        "cfenv": "cpp",
+        "ranges": "cpp",
+        "xhash": "cpp",
+        "xmemory": "cpp",
+        "xstddef": "cpp",
+        "xstring": "cpp",
+        "xtr1common": "cpp",
+        "xtree": "cpp",
+        "xutility": "cpp",
+        "__assert": "cpp",
+        "*.inc": "cpp",
+        "xiosbase": "cpp"
     },
     "cSpell.words": [
         "Ryzen"
     ],
     "C_Cpp.errorSquiggles": "Enabled",
     "cmake.configureOnOpen": true,
-    "cmake.sourceDirectory": "${workspaceFolder}/."
+    "cmake.configureOnEdit": false,
+    "cmake.preferredGenerators": [
+        "Unix Makefiles",
+        "Visual Studio 17 2022"
+    ],
+    // "cmake.buildArgs": [],
+    "cmake.configureSettings": {
+        "BB_ENABLE_TESTS": "ON",
+        "BB_CUDA_USE_NATIVE": "ON"
+    },
+    "C_Cpp.dimInactiveRegions": false,
+    // "cmake.generator": "Unix Makefiles"
+    // "cmake.generator": "Visual Studio 17 2022"
 
-    ,"cmake.generator": "Unix Makefiles"
 }

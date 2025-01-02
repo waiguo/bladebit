@@ -1,19 +1,29 @@
 #include "SysHost.h"
 #include "Platform.h"
-#include "Util.h"
+#include "util/Util.h"
 
-#include <sys/random.h>
 #include <execinfo.h>
 #include <signal.h>
 #include <atomic>
-#include <numa.h>
-#include <numaif.h>
+#include <errno.h>
+#include <stdio.h>
+#include <mutex>
+
+#if !defined(BB_IS_HARVESTER)
+    #include <sys/random.h>
+#endif
+
+#if BB_NUMA_ENABLED
+    #include <numa.h>
+    #include <numaif.h>
+#endif
 
 // #if _DEBUG
     #include "util/Log.h"
 // #endif
 
 std::atomic<bool> _crashed = false;
+
 
 //-----------------------------------------------------------
 size_t SysHost::GetPageSize()
@@ -109,19 +119,19 @@ bool SysHost::VirtualProtect( void* ptr, size_t size, VProtect flags )
 {
     ASSERT( ptr );
 
-    int prot = 0;
+    int prot = PROT_NONE;
 
-    if( IsFlagSet( flags, VProtect::NoAccess ) )
-    {
-        prot = PROT_NONE;
-    }
-    else
-    {
+    // if( IsFlagSet( flags, VProtect::NoAccess ) )
+    // {
+    //     prot = PROT_NONE;
+    // }
+    // else
+    // {
         if( IsFlagSet( flags, VProtect::Read ) )
             prot |= PROT_READ;
         if( IsFlagSet( flags, VProtect::Write ) )
             prot |= PROT_WRITE;
-    }
+    // }
 
     int r = mprotect( ptr, size, prot );
     ASSERT( !r );
@@ -204,6 +214,17 @@ void CrashHandler( int signal )
     int traceSize = backtrace( stackTrace, (int)MAX_POINTERS );
     backtrace_symbols_fd( stackTrace, traceSize, fileno( stderr ) );
     fflush( stderr );
+
+    FILE* crashFile = fopen( "crash.log", "w" );
+    if( crashFile )
+    {
+        fprintf( stderr, "Dumping crash to crash.log\n" );
+        fflush( stderr );
+        
+        backtrace_symbols_fd( stackTrace, traceSize, fileno( crashFile ) );
+        fflush( crashFile );
+        fclose( crashFile );
+    }
     
     exit( 1 );
 }
@@ -215,8 +236,38 @@ void SysHost::InstallCrashHandler()
 }
 
 //-----------------------------------------------------------
+void SysHost::DumpStackTrace()
+{
+    static std::mutex _lock;
+    _lock.lock();
+
+    const size_t MAX_POINTERS = 256;
+    void* stackTrace[256] = { 0 };
+
+    int traceSize = backtrace( stackTrace, (int)MAX_POINTERS );
+    backtrace_symbols_fd( stackTrace, traceSize, fileno( stderr ) );
+    fflush( stderr );
+
+    // FILE* crashFile = fopen( "stack.log", "w" );
+    // if( crashFile )
+    // {
+    //     fprintf( stderr, "Dumping crash to crash.log\n" );
+    //     fflush( stderr );
+        
+    //     backtrace_symbols_fd( stackTrace, traceSize, fileno( crashFile ) );
+    //     fflush( crashFile );
+    //     fclose( crashFile );
+    // }
+
+    _lock.unlock();
+}
+
+//-----------------------------------------------------------
 void SysHost::Random( byte* buffer, size_t size )
 {
+    #if defined(BB_IS_HARVESTER)
+        Panic( "getrandom not supported on bladebit_harvester target.");
+    #else
     // See: https://man7.org/linux/man-pages/man2/getrandom.2.html
 
     ssize_t sizeRead;
@@ -234,17 +285,22 @@ void SysHost::Random( byte* buffer, size_t size )
         sizeRead = getrandom( writer, readSize, 0 );
 
         // Should never get EINTR, but docs say to check anyway.
-        if( sizeRead < 0 && errno != EINTR )
-            Fatal( "getrandom syscall failed." );
+        int err = errno;
+        if( sizeRead < 0 && err != EINTR )
+            Fatal( "getrandom syscall failed with error %d.", err );
 
         writer += (size_t)sizeRead;
     }
+    #endif
 }
 
 // #NOTE: This is not thread-safe
 //-----------------------------------------------------------
 const NumaInfo* SysHost::GetNUMAInfo()
 {
+#if !BB_NUMA_ENABLED
+    return nullptr;
+#else
     if( numa_available() == -1 )
         return nullptr;
 
@@ -315,12 +371,15 @@ const NumaInfo* SysHost::GetNUMAInfo()
     }
 
     return info;
+#endif // BB_NUMA_ENABLED
 }
 
 //-----------------------------------------------------------
 void SysHost::NumaAssignPages( void* ptr, size_t size, uint node )
 {
+#if BB_NUMA_ENABLED
     numa_tonode_memory( ptr, size, (int)node );
+#endif
 }
 
 //-----------------------------------------------------------
@@ -330,6 +389,7 @@ bool SysHost::NumaSetThreadInterleavedMode()
     if( !numa )
         return false;
     
+#if BB_NUMA_ENABLED
     const size_t MASK_SIZE = 128;
     unsigned long mask[MASK_SIZE];
     memset( mask, 0xFF, sizeof( mask ) );
@@ -348,6 +408,7 @@ bool SysHost::NumaSetThreadInterleavedMode()
     #endif
 
     return r == 0;
+#endif // BB_NUMA_ENABLED
 }
 
 //-----------------------------------------------------------
@@ -357,6 +418,7 @@ bool SysHost::NumaSetMemoryInterleavedMode( void* ptr, size_t size )
     if( !numa )
         return false;
 
+#if BB_NUMA_ENABLED
     const size_t MASK_SIZE = 128;
     unsigned long mask[MASK_SIZE];
     memset( mask, 0xFF, sizeof( mask ) );
@@ -375,6 +437,7 @@ bool SysHost::NumaSetMemoryInterleavedMode( void* ptr, size_t size )
     #endif
 
     return r == 0;
+#endif // BB_NUMA_ENABLED
 }
 
 //-----------------------------------------------------------
@@ -384,6 +447,7 @@ int SysHost::NumaGetNodeFromPage( void* ptr )
     if( !numa )
         return -1;
 
+#if BB_NUMA_ENABLED
     int node = -1;
     int r = numa_move_pages( 0, 1, &ptr, nullptr, &node, 0 );
 
@@ -399,4 +463,5 @@ int SysHost::NumaGetNodeFromPage( void* ptr )
     }
 
     return node;
+#endif // BB_NUMA_ENABLED
 }

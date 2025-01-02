@@ -1,6 +1,7 @@
-cmake_minimum_required(VERSION 3.14 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.19 FATAL_ERROR)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_CONFIGURATION_TYPES Release Debug)
@@ -9,314 +10,157 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release"
         CACHE STRING "Possible values are: Release, Debug"
         FORCE
-   )
+    )
 endif()
-message("Config: ${CMAKE_BUILD_TYPE}")
 
-project(bladebit)
+# Allows for CMAKE_MSVC_RUNTIME_LIBRARY
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW) 
+endif()
 
-# On CI, update Version.h from our VERSION file
-# if(DEFINED ENV{CI})
-#     message("Updating Version.h")
-#     if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
-#         execute_process(COMMAND bash.exe extract-version.sh WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-#     else()
-#         execute_process(COMMAND bash extract-version.sh WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-#     endif()
-# endif()
+set(CMAKE_OSX_DEPLOYMENT_TARGET "10.16" CACHE STRING "macOS minimum supported version.")
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "MSVC Runtime Library")
+
+project(bladebit LANGUAGES C CXX ASM)
+
+# Ensure supported OS and Architecture
+if(NOT( (${CMAKE_SYSTEM_NAME} MATCHES "Linux") OR (${CMAKE_SYSTEM_NAME} MATCHES "Darwin") OR (${CMAKE_SYSTEM_NAME} MATCHES "Windows") ))
+    message( FATAL_ERROR "Unsupported operating system '${CMAKE_SYSTEM_NAME}'" )
+endif()
+
+if(NOT (${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "arm64" OR ${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "aarch64" OR ${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "AMD64" OR ${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "x86_64"))
+    message( FATAL_ERROR "Unsupported architecture '${CMAKE_HOST_SYSTEM_PROCESSOR}'" )
+endif()
+
+if(NOT CMAKE_CUDA_COMPILER)
+    include(FindCUDAToolkit)
+
+    if(CUDAToolkit_FOUND)
+        message("Found CUDA: true")
+        message("NVCC      : ${CUDAToolkit_NVCC_EXECUTABLE}")
+        set(CMAKE_CUDA_COMPILER ${CUDAToolkit_NVCC_EXECUTABLE})
+    endif()
+endif()
+
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+endif()
 
 
+message("Config   : ${CMAKE_BUILD_TYPE}")
+message("Compiler : ${CMAKE_CXX_COMPILER_ID}")
+if(DEFINED ENV{CI})
+    message("CI build : true")
+else()
+    message("CI build : false")
+endif()
 
 set(CMAKE_MODULE_PATH
   ${CMAKE_MODULE_PATH}
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules
 )
 
-# Grab BLS
+# Is this project included as a dependency/FetchContent?
+if(NOT(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
+    set(BB_IS_DEPENDENCY ON)
+    set(BB_ENABLE_TESTS OFF)
+    set(BB_ENABLE_EXE OFF)
+endif()
+
+
+#
+# Options
+#
+option(BENCHMARK_MODE "Enable benchmark mode for memplot. No final plot is written." OFF)
+if(BENCHMARK_MODE)
+    add_compile_definitions("BB_BENCHMARK_MODE=1")
+endif()
+
+option(ENABLE_DISK_METRICS "Enable I/O metrics for diskplot." OFF)
+if(ENABLE_DISK_METRICS)
+    add_compile_definitions("BB_IO_METRICS_ON=1")
+endif()
+
+# NOTE: These are mostly sandbox test environment, not proper tests
+option(BB_ENABLE_TESTS "Enable tests." OFF)
+option(NO_CUDA_HARVESTER "Explicitly disable CUDA in the bladebit_harvester target." OFF)
+option(BB_NO_EMBED_VERSION "Disable embedding the version when building locally (non-CI)." OFF)
+option(BB_HARVESTER_ONLY "Enable only the harvester target." OFF)
+option(BB_HARVESTER_STATIC "Build the harvester target as a static library." OFF)
+option(BB_CUDA_USE_NATIVE "Only build the native CUDA architecture when in release mode." OFF)
+
+#
+# Dependencies
+#
 include(FetchContent)
 
-FetchContent_Declare(
-  bls
-  GIT_REPOSITORY https://github.com/Chia-Network/bls-signatures.git
-  GIT_TAG        1.0.6
-)
-
-set(BUILD_BLS_PYTHON_BINDINGS "0" CACHE STRING "0")
-set(BUILD_BLS_TESTS "0" CACHE STRING "")
-set(BUILD_BLS_BENCHMARKS "0" CACHE STRING "")
-FetchContent_MakeAvailable(bls)
-
-# Config
-set(CMAKE_C_FLAGS_RELEASE_INIT)
-set(CMAKE_C_FLAGS_DEBUG_INIT)
-set(CMAKE_CXX_FLAGS_RELEASE_INIT)
-set(CMAKE_CXX_FLAGS_DEBUG_INIT)
-
-
-set(c_opts)
-set(link_opts)
-
-set(release_c_opts)
-set(debug_c_opts)
-set(dev_c_opts)
-
-set(release_link_opts)
-set(debug_link_opts)
-
-if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
-
-    # MSVC
-    set(c_opts
-        /std:c++17
-        /Zc:__cplusplus
-        /MP
-        /Zi
-        # /EHsc-
-        # /Wall
-        /W3
-        /WX
-        /FIpch.h 
-        /wd4068
-        /wd4464
-        /wd4668
-        /wd4820
-        /wd4514
-        /wd4626
-        /wd5027
-        /DUNICODE=1
-        /DWIN32_LEAN_AND_MEAN=1
-        /DNOMINMAX=1
-        /D_CRT_SECURE_NO_WARNINGS=1
-        /D_HAS_EXCEPTIONS=0
-        ${c_opts})
-    
-    set(link_opts 
-        /SUBSYSTEM:CONSOLE
-        /STACK:33554432,1048576
-        ${link_opts})
-
-    set(release_c_opts 
-        /MT
-        /Oi
-        /O2
-        /Gy
-        /GL
-        /DNDEBUG=1
-        /D_NDEBUG=1
-        ${release_c_opts})
-
-    set(debug_c_opts 
-        /MTd
-        /Od
-        /DDEBUG=1
-        /D_DEBUG=1
-        ${debug_c_opts})
-
-    set(dev_c_opts 
-        ${dev_c_opts})
-
-    
-    set(release_link_opts 
-        /DEBUG:FULL
-        /LTCG
-        /OPT:REF,ICF,LBR
-        ${release_link_opts})
-
-    set(debug_link_opts
-        /DEBUG:FASTLINK
-        /OPT:NOREF,NOICF,NOLBR
-        /INCREMENTAL
-        ${debug_link_opts})
-
-    # Dependency config
-    target_compile_options(bls     PRIVATE /MP)
-    target_compile_options(relic_s PRIVATE /MP)
-    target_compile_options(sodium  PRIVATE /MP)
-
-    target_compile_options(bls     PRIVATE $<$<CONFIG:release>:/MT>)
-    target_compile_options(relic_s PRIVATE $<$<CONFIG:release>:/MT>)
-    target_compile_options(sodium  PRIVATE $<$<CONFIG:release>:/MT>)
-
-    target_compile_options(bls     PRIVATE $<$<CONFIG:debug>:/MTd>)
-    target_compile_options(relic_s PRIVATE $<$<CONFIG:debug>:/MTd>)
-    target_compile_options(sodium  PRIVATE $<$<CONFIG:debug>:/MTd>)
-    
-else()
-
-    # *Nix
-    set(c_opts --include=pch.h -Wall -Wno-comment -Wno-unknown-pragmas -g ${c_opts})
-
-    set(release_c_opts 
-        -O3 -flto
-        -D_NDEBUG=1
-        -DNDEBUG=1
-        ${release_c_opts})
-
-    set(debug_c_opts 
-        -O0
-        -DDEBUG=1
-        -D_DEBUG=1
-        ${debug_c_opts})
-
-    set(dev_c_opts 
-        ${dev_c_opts})
-
-    # GCC
-    if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-    
-        set(c_opts -fmax-errors=5 ${c_opts})
-
-    # Clang
-    elseif("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
-        
-        set(c_opts_FLAGS -ferror-limit=5 -fdeclspec -Wunknown-pragmas ${c_opts})
-
-    endif()
-
-endif()
-
-
-# Main Sources
-file(GLOB_RECURSE bb_sources
-    RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
-    CONFIGURE_DEPENDS
-    LIST_DIRECTORIES false
-    src/*.cpp
-    src/*.c
-)
-
-# Headers
-file(GLOB_RECURSE bb_headers
-    RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
-    CONFIGURE_DEPENDS
-    LIST_DIRECTORIES false
-    src/*.h
-    src/*.hpp
-    src/*.inl
-)
-
-# Configure dependent on config/platform/architecture
-list(FILTER bb_sources EXCLUDE REGEX "src/main\.cpp")
-list(FILTER bb_sources EXCLUDE REGEX "src/(test|platform)/.+")
-list(FILTER bb_sources EXCLUDE REGEX "src/b3/blake3_(avx|sse).+")
-
-# Architecture
-if(${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "x86_64" OR ${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "AMD64")
-
-    if(NOT MSVC)
-        
-        list(APPEND bb_sources
-            src/b3/blake3_avx2_x86-64_unix.S
-            src/b3/blake3_avx512_x86-64_unix.S
-            src/b3/blake3_sse41_x86-64_unix.S
-        )
-
-        set_source_files_properties(
-            src/b3/blake3_avx2_x86-64_unix.S
-            src/b3/blake3_avx512_x86-64_unix.S
-            src/b3/blake3_sse41_x86-64_unix.S
-            PROPERTIES LANGUAGE C)
-    else()
-        list(APPEND bb_sources
-            src/b3/blake3_avx2.c
-            src/b3/blake3_avx512.c
-            src/b3/blake3_sse41.c
-        )
-        # Disable blake3 convertion loss of data warnings 
-        set_source_files_properties( 
-            src/b3/blake3_avx2.c
-            src/b3/blake3_avx512.c
-            src/b3/blake3_sse41.c
-            PROPERTIES COMPILE_FLAGS
-            /wd4244
-        )
-    endif()
-
-elseif(${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "arm64" OR ${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "aarch64")
-else()
-    message( FATAL_ERROR "Unsupported architecture '${CMAKE_HOST_SYSTEM_PROCESSOR}'" )
-endif()
-
-# OS
-if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-
-    file(GLOB_RECURSE src_linux RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} 
-        CONFIGURE_DEPENDS LIST_DIRECTORIES false
-        src/platform/unix/*.cpp
-        src/platform/linux/*.cpp
-    )
-    list(APPEND bb_sources ${src_linux})
-
-elseif(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
-    
-    file(GLOB_RECURSE src_win RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} 
-        CONFIGURE_DEPENDS LIST_DIRECTORIES false
-        src/platform/win32/*.cpp
-    )
-    list(APPEND bb_sources ${src_win})
-
-elseif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-
-    file(GLOB_RECURSE src_mac RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} 
-        CONFIGURE_DEPENDS LIST_DIRECTORIES false
-        src/platform/unix/*.cpp
-        src/platform/macos/*.cpp
-    )
-    list(APPEND bb_sources ${src_mac})
-
-else()
-    message( FATAL_ERROR "Unsupported operating system '${CMAKE_SYSTEM_NAME}'" )
-endif()
-
-# Dev config?
-file(GLOB_RECURSE src_dev RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} 
-    CONFIGURE_DEPENDS LIST_DIRECTORIES false
-    src/test/*.cpp
-)
-
-file(GLOB_RECURSE headers_dev RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} 
-    CONFIGURE_DEPENDS LIST_DIRECTORIES false
-    src/test/*.h
-)
-
-
-# Exe
+# Threads
 find_package(Threads REQUIRED)
 
-set(platform_libs)
+if(NOT ${BB_HARVESTER_ONLY})
+    # BLS
+    FetchContent_Declare(
+    bls
+    GIT_REPOSITORY https://github.com/Chia-Network/bls-signatures.git
+    GIT_TAG        2.0.2
+    EXCLUDE_FROM_ALL ${BB_IS_DEPENDENCY}
+)
 
-if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-    find_package(NUMA REQUIRED)
-    set(platform_libs ${NUMA_LIBRARY} gmp)
+    set(BUILD_BLS_PYTHON_BINDINGS "0" CACHE STRING "0")
+    set(BUILD_BLS_TESTS "0" CACHE STRING "")
+    set(BUILD_BLS_BENCHMARKS "0" CACHE STRING "")
+    FetchContent_MakeAvailable(bls)
+
+    # NUMA
+    if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+        find_package(NUMA REQUIRED)
+        set(platform_libs ${NUMA_LIBRARY})
+    endif()
+endif() # BB_HARVESTER_ONLY
+
+#
+# Internal Config
+#
+set(is_release $<CONFIG:Release>)
+set(is_debug $<CONFIG:Debug>)
+set(is_c_cpp $<COMPILE_LANGUAGE:CXX,C>)
+set(is_cuda $<COMPILE_LANGUAGE:CUDA>)
+set(is_cuda_release $<AND:${is_cuda},${is_release}>)
+set(is_cuda_debug $<AND:${is_cuda},${is_debug}>)
+set(is_x86 $<OR:$<STREQUAL:${CMAKE_HOST_SYSTEM_PROCESSOR},AMD64>,$<STREQUAL:${CMAKE_HOST_SYSTEM_PROCESSOR},x86_64>>)
+set(is_arm $<OR:$<STREQUAL:${CMAKE_HOST_SYSTEM_PROCESSOR},arm64>,$<STREQUAL:${CMAKE_HOST_SYSTEM_PROCESSOR},aarch64>>)
+set(is_msvc_c_cpp $<AND:${is_c_cpp},$<CXX_COMPILER_ID:MSVC>>)
+
+
+if(CUDAToolkit_FOUND AND NOT ${NO_CUDA_HARVESTER})
+    set(have_cuda $<BOOL:1>)
+else()
+    set(have_cuda $<BOOL:0>)
 endif()
 
-set(bb_include_dirs 
-    ${INCLUDE_DIRECTORIES}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
 
+#
+# Targets
+#
+include(Config.cmake)
 
-# BladeBit
-add_executable(bladebit     src/main.cpp ${bb_sources} ${bb_headers})
-add_executable(bladebit_dev EXCLUDE_FROM_ALL src/test/test_main.cpp ${bb_sources} ${src_dev} ${bb_headers} ${headers_dev})
+if(NOT ${BB_HARVESTER_ONLY})
+    if((NOT BB_IS_DEPENDENCY) AND (NOT BB_NO_EMBED_VERSION))
+        include(cmake_modules/EmbedVersion.cmake)
+    endif()
 
-macro(config_proj tgt)
+    include(Bladebit.cmake)
+    set_target_properties(bladebit_core bladebit PROPERTIES EXCLUDE_FROM_ALL $<BOOL:${BB_IS_DEPENDENCY}>)
 
-    target_compile_options(${tgt} PRIVATE $<$<CONFIG:release>:${c_opts} ${release_c_opts}>)
-    target_compile_options(${tgt} PRIVATE $<$<CONFIG:debug>:${c_opts} ${debug_c_opts}>)
-    target_link_options(${tgt} PRIVATE $<$<CONFIG:release>:${link_opts} ${release_link_opts}>)
-    target_link_options(${tgt} PRIVATE $<$<CONFIG:debug>:${link_opts} ${debug_link_opts}>)
+    if(CUDAToolkit_FOUND)
+        include(BladebitCUDA.cmake)
+        set_target_properties(bladebit_cuda PROPERTIES EXCLUDE_FROM_ALL $<BOOL:${BB_IS_DEPENDENCY}>)
+    endif()
+endif()
 
-    target_include_directories(${tgt} PRIVATE ${bb_include_dirs})
-    target_link_libraries(${tgt} Threads::Threads bls ${platform_libs})
-endmacro()
+include(Harvester.cmake)
 
-config_proj(bladebit)
-config_proj(bladebit_dev)
-
-
-# Pretty source view for IDE projects
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src 
-    FILES ${bb_sources} ${bb_headers} ${src_dev} ${headers_dev}
-)
+if(${BB_ENABLE_TESTS} AND NOT ${BB_HARVESTER_ONLY})
+    include(Tests.cmake)
+endif()
 

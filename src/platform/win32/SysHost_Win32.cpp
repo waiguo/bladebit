@@ -1,11 +1,16 @@
 #include "SysHost.h"
 #include "Platform.h"
-#include "Util.h"
+#include "util/Util.h"
 #include "util//Log.h"
 
+#include <Windows.h>
 #include <processthreadsapi.h>
 #include <systemtopologyapi.h>
 #include <psapi.h>
+#include <dbghelp.h>
+
+
+static_assert( INVALID_HANDLE_VALUE == INVALID_WIN32_HANDLE );
 
 /*
 * Based on source from libSodium: ref: https://github.com/jedisct1/libsodium/blob/master/src/libsodium/randombytes/sysrandom/randombytes_sysrandom.c
@@ -16,6 +21,12 @@
 #define RtlGenRandom SystemFunction036
 extern "C" BOOLEAN NTAPI RtlGenRandom( PVOID RandomBuffer, ULONG RandomBufferLength );
 #pragma comment( lib, "advapi32.lib" )
+
+// For stack back trace
+#pragma comment( lib, "dbghelp.lib" )
+
+static bool EnableLockMemoryPrivilege();
+
 
 // Helper structs to help us iterate these variable-length structs
 template<typename T>
@@ -106,15 +117,39 @@ void* SysHost::VirtualAlloc( size_t size, bool initialize )
     SYSTEM_INFO info;
     ::GetSystemInfo( &info );
 
-    const size_t pageSize = (size_t)info.dwPageSize;
-    size = CeildDiv( size, pageSize );
+    size_t pageSize  = (size_t)info.dwPageSize;
+    DWORD  allocType = MEM_RESERVE | MEM_COMMIT;
 
-    void* ptr = ::VirtualAlloc( NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    // #TODO: Add a hint to see if we want to allocate large pages.
+    const bool useLargePages = false; //EnableLockMemoryPrivilege();
+//    Log::Line( "Large page support: %s", useLargePages ? "true" : "false" );
+//    if( useLargePages )
+//    {
+//        pageSize = (size_t)::GetLargePageMinimum();
+//        allocType |= MEM_LARGE_PAGES;
+//    }
+//    else
+//        Log::Line( "No large page support." );
 
+    // See if we can allocate large pages
+    size_t allocSize = RoundUpToNextBoundaryT( size, pageSize );
+
+    void* ptr = ::VirtualAlloc( NULL, allocSize, allocType, PAGE_READWRITE );
+
+    if( !ptr && useLargePages )
+    {
+        const DWORD err = GetLastError();
+        Log::Line( "Warning: Failed to allocate large pages with error: %d.", err );
+
+        // Try without large pages
+        allocSize = RoundUpToNextBoundaryT( size, (size_t)info.dwPageSize );
+        ptr = ::VirtualAlloc( NULL, allocSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    }
+
+    // #TODO: Remove this
     if( ptr && initialize )
     {
         // Fault memory pages
-
         byte* page = (byte*)ptr;
 
         const size_t pageCount = size / pageSize;
@@ -142,6 +177,8 @@ void SysHost::VirtualFree( void* ptr )
     {
         const DWORD err = GetLastError();
         Log::Error( "VirtualFree() failed with error: %d", err );
+
+        DumpStackTrace();
     }
 }
 
@@ -149,8 +186,35 @@ void SysHost::VirtualFree( void* ptr )
 bool SysHost::VirtualProtect( void* ptr, size_t size, VProtect flags )
 {
     ASSERT( ptr );
+    if( !ptr )
+        return false;
 
-    // #TODO: Implement me
+    DWORD winFlags;
+    
+    if( flags == VProtect::NoAccess )
+    {
+        winFlags = PAGE_NOACCESS;
+    }
+    else
+    {
+        if( IsFlagSet( flags, VProtect::Write ) )
+        {
+            winFlags = PAGE_READWRITE;
+        }
+        else
+        {
+            ASSERT( IsFlagSet( flags, VProtect::Read ) );
+            winFlags = PAGE_READONLY;
+        }
+    }
+
+    DWORD oldProtect = 0;
+    if( ::VirtualProtect( ptr, (SIZE_T)size, winFlags, &oldProtect ) == FALSE )
+    {
+        Log::Error( "::VirtualProtect() failed with error: %d", (int)::GetLastError() );
+        return false;
+    }
+
     return true;
 }
 
@@ -237,6 +301,71 @@ bool SysHost::SetCurrentThreadAffinityCpuId( uint32 cpuId )
 void SysHost::InstallCrashHandler()
 {
     // #TODO: Implement me
+}
+
+//-----------------------------------------------------------
+void SysHost::DumpStackTrace()
+{
+    /// See: https://learn.microsoft.com/en-us/windows/win32/debug/retrieving-symbol-information-by-address
+    constexpr uint32 MAX_FRAMES = 256;
+
+    void* frames[MAX_FRAMES] = {};
+
+    const uint32 frameCount = (uint32)::CaptureStackBackTrace( 0, MAX_FRAMES, frames, nullptr );
+
+    if( frameCount < 1 )
+        return;
+
+    const HANDLE curProcess = ::GetCurrentProcess();
+
+    ::SymSetOptions( SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES );
+    if( !::SymInitialize( curProcess, NULL, TRUE ) )
+    {
+        Log::Error( "Waring: SymInitialize returned error: %d", GetLastError() );
+        return;
+    }
+
+
+    byte* symBuffer = (byte*)malloc( sizeof( SYMBOL_INFO ) + sizeof(TCHAR) * (MAX_SYM_NAME+1) );
+    if( !symBuffer )
+    {
+        Log::Error( "Warning: Failed to dump stack trace." );
+        return;
+    }
+    
+    auto* symbol = reinterpret_cast<SYMBOL_INFO*>( symBuffer );
+    symbol->MaxNameLen   = MAX_SYM_NAME;
+    symbol->SizeOfStruct = sizeof( SYMBOL_INFO );
+
+    IMAGEHLP_LINE64 line = {};
+    line.SizeOfStruct = sizeof( IMAGEHLP_LINE64 );
+
+    for( uint32 i = 0; i < frameCount; i++ )
+    {
+              DWORD64 displacement = 0;
+        const DWORD64 address      = (DWORD64)frames[i];
+
+        if( ::SymFromAddr( curProcess, address, &displacement, symbol ) )
+        {
+            DWORD lineDisplacement = 0;
+            if( ::SymGetLineFromAddr64( curProcess, address, &lineDisplacement, &line ) )
+            {
+                Log::Line( "0x%016llX @ %s::%s() line: %llu", (llu)address, line.FileName, symbol->Name, (llu)line.LineNumber );
+            }
+            else
+            {
+                Log::Line( "0x%016llX @ <unknown>::%s()", (llu)address, symbol->Name );
+            }
+        }
+        else
+        {
+            Log::Line( "0x%016llX @ <unknown>::<unknown>", (llu)address );
+        }
+    }
+
+    Log::Flush();
+
+    free( symBuffer );
 }
 
 //-----------------------------------------------------------
@@ -508,4 +637,61 @@ int SysHost::NumaGetNodeFromPage( void* ptr )
     // }
 
     return -1;
+}
+
+// #See:
+//  https://docs.microsoft.com/en-us/windows/win32/memory/large-page-support
+//  https://docs.microsoft.com/en-us/windows/win32/secauthz/enabling-and-disabling-privileges-in-c--
+//  https://docs.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-adjusttokenprivileges
+//-----------------------------------------------------------
+bool EnableLockMemoryPrivilege()
+{
+    static int32 _enabledState = 0; // 0 = uninitialized, -1 = failed to enabled, 1 = enabled
+    if( _enabledState != 0 )
+        return _enabledState == 1;
+
+    HANDLE hProc, hToken;
+    hProc = GetCurrentProcess();
+
+    if( !OpenProcessToken( hProc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken ) )
+        return false;   // Try again later
+    
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+
+    if( !LookupPrivilegeValue(
+        NULL,                   // lookup privilege on local system
+        SE_LOCK_MEMORY_NAME,    // privilege to lookup 
+        &luid ) )               // receives LUID of privilege
+    {
+        goto Failed;
+    }
+
+    tp.PrivilegeCount           = 1;
+    tp.Privileges[0].Luid       = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if( !AdjustTokenPrivileges(
+        hToken,
+        FALSE,
+        &tp,
+        sizeof( TOKEN_PRIVILEGES ),
+        (PTOKEN_PRIVILEGES)NULL,
+        (PDWORD)NULL ) )
+    {
+        goto Failed;
+    }
+
+    // Still have to check if it actually adjusted the privilege
+    // #See: https://devblogs.microsoft.com/oldnewthing/20211126-00/?p=105973
+    if( ::GetLastError() != ERROR_SUCCESS )
+        goto Failed;
+
+    _enabledState = 1;
+    return true;
+
+Failed:
+    ::CloseHandle( hToken );
+    _enabledState = -1;
+    return false;
 }
