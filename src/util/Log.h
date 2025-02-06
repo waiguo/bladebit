@@ -24,6 +24,21 @@ public:
 
     static void Flush();
     static void FlushError();
+
+    static void NewLine();
+
+#if DBG_LOG_ENABLE
+    static void Debug( const char* msg, ... );
+    static void DebugV( const char* msg, va_list args );
+    static void DebugWrite( const char* msg, size_t size );
+#else
+    static inline void Debug( const char* msg, ... ) {}
+    static void DebugV( const char* msg, va_list args ) {}
+    static void DebugWrite( const char* msg, size_t size ) {}
+#endif
+
+    static void SafeWrite( const char* msg, size_t size );
+
 private:
 
     static FILE* GetOutStream();
